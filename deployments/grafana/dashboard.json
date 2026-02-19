@@ -1,0 +1,252 @@
+{
+  "title": "Enterprise AI Agent Platform",
+  "uid": "agent-platform-main",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["agent-platform", "production"],
+  "panels": [
+    {
+      "title": "Platform Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "title": "API Availability (SLO: 99.99%)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [{
+        "expr": "(1 - (sum(rate(agentplatform_http_requests_total{status=~\"5..\"}[24h])) / sum(rate(agentplatform_http_requests_total[24h])))) * 100",
+        "legendFormat": "Availability %"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "red", "value": 0 },
+            { "color": "yellow", "value": 99.9 },
+            { "color": "green", "value": 99.99 }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Active Agent Tasks",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "targets": [{
+        "expr": "agentplatform_agent_active_tasks",
+        "legendFormat": "Active Tasks"
+      }],
+      "options": {
+        "colorMode": "value",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 80 },
+            { "color": "red", "value": 100 }
+          ]
+        }
+      }
+    },
+    {
+      "title": "LLM Cost (Last Hour USD)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "targets": [{
+        "expr": "sum(increase(agentplatform_llm_cost_usd_total[1h]))",
+        "legendFormat": "USD/hr"
+      }],
+      "options": {
+        "colorMode": "background",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 100 },
+            { "color": "red", "value": 500 }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Security Blocks (Last Hour)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "targets": [{
+        "expr": "sum(increase(agentplatform_security_injection_detected_total[1h])) + sum(increase(agentplatform_security_ssrf_blocked_total[1h]))",
+        "legendFormat": "Security Blocks"
+      }],
+      "options": { "colorMode": "value" }
+    },
+    {
+      "title": "HITL Pending Reviews",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "targets": [{
+        "expr": "sum(agentplatform_hitl_requests_total{outcome=\"pending\"})",
+        "legendFormat": "Pending"
+      }],
+      "options": {
+        "colorMode": "background",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 10 },
+            { "color": "red", "value": 50 }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Browser Pool Utilisation",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "targets": [{
+        "expr": "(agentplatform_browser_sessions_active / agentplatform_browser_pool_size) * 100",
+        "legendFormat": "Pool %"
+      }],
+      "options": {
+        "thresholds": {
+          "mode": "percentage",
+          "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 70 },
+            { "color": "red", "value": 90 }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Request Latency",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "title": "API Request Duration (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(agentplatform_http_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(agentplatform_http_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(agentplatform_http_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        }
+      }
+    },
+    {
+      "title": "LLM Call Duration (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(agentplatform_llm_call_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(agentplatform_llm_call_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(agentplatform_llm_call_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Security & Compliance",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "title": "Injection Detection by Pattern",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [{
+        "expr": "sum by (pattern) (rate(agentplatform_security_injection_detected_total[5m]))",
+        "legendFormat": "{{ pattern }}"
+      }]
+    },
+    {
+      "title": "Compliance Blocks by Reason",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [{
+        "expr": "sum by (reason) (increase(agentplatform_compliance_blocks_total[1h]))",
+        "legendFormat": "{{ reason }}"
+      }]
+    },
+    {
+      "title": "Cost Tracking",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "title": "LLM Cost by Provider (USD/hour)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [{
+        "expr": "sum by (provider) (rate(agentplatform_llm_cost_usd_total[5m]) * 3600)",
+        "legendFormat": "{{ provider }}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "title": "Token Consumption Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum by (provider) (rate(agentplatform_llm_tokens_consumed_total{type=\"input\"}[5m]))",
+          "legendFormat": "Input ({{ provider }})"
+        },
+        {
+          "expr": "sum by (provider) (rate(agentplatform_llm_tokens_consumed_total{type=\"output\"}[5m]))",
+          "legendFormat": "Output ({{ provider }})"
+        }
+      ]
+    },
+    {
+      "title": "Error Budget (30-day)",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }
+    },
+    {
+      "title": "API Gateway Error Budget Remaining",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 33 },
+      "targets": [{
+        "expr": "((1 - (sum(rate(agentplatform_http_requests_total{status=~\"5..\"}[30d])) / sum(rate(agentplatform_http_requests_total[30d])))) - 0.9999) / (1 - 0.9999) * 100",
+        "legendFormat": "Budget %"
+      }],
+      "options": {
+        "thresholds": {
+          "mode": "percentage",
+          "steps": [
+            { "color": "red", "value": 0 },
+            { "color": "yellow", "value": 25 },
+            { "color": "green", "value": 50 }
+          ]
+        }
+      }
+    }
+  ]
+}

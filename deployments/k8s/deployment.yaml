@@ -1,0 +1,377 @@
+---
+# Namespace with strict network policy defaults
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-platform
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# Default deny-all NetworkPolicy for the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: agent-platform
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# API Gateway deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: agent-platform
+  labels:
+    app: api-gateway
+    version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero-downtime deployments only
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        version: "1.0.0"
+      annotations:
+        # Force pod restart on ConfigMap change
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: api-gateway
+      automountServiceAccountToken: false
+      # gVisor runtime for agent workers
+      # runtimeClassName: gvisor  # Enable for agent-worker deployments
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api-gateway
+          image: ghcr.io/enterprise/agent-platform:1.0.0
+          imagePullPolicy: Always
+          command: ["/app/server"]
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: SERVER_PORT
+              value: "8443"
+            - name: ENVIRONMENT
+              value: "production"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: SERVICE_NAME
+              value: "api-gateway"
+            # Sensitive values come from Vault via the sidecar injector
+            - name: DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-secrets
+                  key: database-dsn
+            - name: REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-secrets
+                  key: redis-addr
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-secrets
+                  key: redis-password
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-secrets
+                  key: nats-url
+            - name: VAULT_ADDR
+              value: "https://vault.vault.svc.cluster.local:8200"
+            - name: TLS_CERT_FILE
+              value: "/tls/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "/tls/tls.key"
+            - name: MTLS_CA_FILE
+              value: "/tls/ca.crt"
+            - name: MTLS_CERT_FILE
+              value: "/tls/tls.crt"
+            - name: MTLS_KEY_FILE
+              value: "/tls/tls.key"
+            - name: TEMPORAL_HOST_PORT
+              value: "temporal-frontend.temporal.svc.cluster.local:7233"
+            - name: OPA_POLICY_BUNDLE_URL
+              value: "http://opa.agent-platform.svc.cluster.local:8181/bundles/platform"
+            - name: TRACING_ENDPOINT
+              value: "http://tempo.observability.svc.cluster.local:4317"
+            - name: BROWSER_EGRESS_PROXY_URL
+              value: "http://egress-proxy.agent-platform.svc.cluster.local:3128"
+            - name: NATS_CREDENTIALS_FILE
+              value: "/nats/nats.creds"
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: nats-creds
+              mountPath: /nats
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9090
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9090
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 9090
+            failureThreshold: 30
+            periodSeconds: 10
+      volumes:
+        - name: tls
+          secret:
+            secretName: api-gateway-tls
+        - name: nats-creds
+          secret:
+            secretName: nats-credentials
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: api-gateway
+      terminationGracePeriodSeconds: 60
+
+---
+# Horizontal Pod Autoscaler for API Gateway
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway-hpa
+  namespace: agent-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 min cooldown on scale-down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+
+---
+# Agent Worker deployment (gVisor-sandboxed)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-worker
+  namespace: agent-platform
+  labels:
+    app: agent-worker
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: agent-worker
+  template:
+    metadata:
+      labels:
+        app: agent-worker
+    spec:
+      serviceAccountName: agent-worker
+      automountServiceAccountToken: false
+      runtimeClassName: gvisor  # gVisor syscall interception
+      nodeSelector:
+        node-role: agent-worker  # Dedicated node pool
+      tolerations:
+        - key: "agent-worker"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-worker
+          image: ghcr.io/enterprise/agent-platform:1.0.0
+          imagePullPolicy: Always
+          command: ["/app/worker"]
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      terminationGracePeriodSeconds: 120  # Allow in-progress tasks to complete
+
+---
+# Service for API Gateway
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: agent-platform
+spec:
+  selector:
+    app: api-gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+
+---
+# NetworkPolicy: allow API gateway ingress from load balancer only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-ingress
+  namespace: agent-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 8443
+  egress:
+    # Allow connection to Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+    # Allow connection to Postgres
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+    # Allow connection to NATS
+    - to:
+        - podSelector:
+            matchLabels:
+              app: nats
+      ports:
+        - port: 4222
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+
+---
+# PodDisruptionBudget: ensure minimum availability during node maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway-pdb
+  namespace: agent-platform
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+
+---
+# ServiceAccount for API gateway (minimal permissions)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-gateway
+  namespace: agent-platform
+  annotations:
+    # Annotate for Vault Kubernetes auth if using Vault agent injector
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "api-gateway"

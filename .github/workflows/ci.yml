@@ -1,0 +1,337 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, release/*]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.22"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.57
+          args: --timeout=5m
+
+      - name: gosec security scanner
+        uses: securego/gosec@v2.19.0
+        with:
+          args: '-severity high -confidence high ./...'
+
+      - name: CodeQL init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+
+      - name: CodeQL autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL analyze
+        uses: github/codeql-action/analyze@v3
+
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: agentplatform_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download && go mod verify
+
+      - name: Run tests with race detector
+        env:
+          DATABASE_DSN: "postgres://postgres:testpass@localhost:5432/agentplatform_test?sslmode=disable"
+          REDIS_ADDR: "localhost:6379"
+          REDIS_PASSWORD: ""
+          ENVIRONMENT: "test"
+        run: |
+          go test -race -cover -coverprofile=coverage.out -covermode=atomic \
+            -timeout=120s ./...
+
+      - name: Enforce coverage threshold (80%)
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "FAIL: Coverage ${COVERAGE}% is below 80% threshold"
+            exit 1
+          fi
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.out
+          fail_ci_if_error: false
+
+  build:
+    name: Build and Scan
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployments/docker/Dockerfile
+          target: production
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'  # Fail CI on critical/high vulns
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign container image (keyless, OIDC)
+        if: github.event_name != 'pull_request'
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.agent-platform.example.com
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig for staging cluster
+        run: aws eks update-kubeconfig --name agent-platform-staging --region us-east-1
+
+      - name: Deploy to staging via Helm
+        run: |
+          helm upgrade --install agent-platform ./helm/agent-platform \
+            --namespace agent-platform \
+            --create-namespace \
+            --set image.tag=sha-${{ github.sha }} \
+            --set image.registry=${{ env.REGISTRY }} \
+            --set environment=staging \
+            --set replicaCount=2 \
+            --values ./helm/agent-platform/values-staging.yaml \
+            --wait \
+            --timeout=5m
+
+      - name: Run smoke tests against staging
+        run: |
+          chmod +x ./scripts/smoke-test.sh
+          PLATFORM_URL=https://staging.agent-platform.example.com ./scripts/smoke-test.sh
+
+      - name: Run k6 load test (staging)
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/load/k6-staging.js
+        env:
+          PLATFORM_URL: https://staging.agent-platform.example.com
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+
+  deploy-production:
+    name: Deploy to Production (Canary)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://agent-platform.example.com
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PRODUCTION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig for production cluster
+        run: aws eks update-kubeconfig --name agent-platform-prod --region us-east-1
+
+      # Step 1: Deploy canary at 5% traffic weight
+      - name: Deploy canary (5% traffic)
+        run: |
+          helm upgrade --install agent-platform-canary ./helm/agent-platform \
+            --namespace agent-platform \
+            --set image.tag=sha-${{ github.sha }} \
+            --set canary.enabled=true \
+            --set canary.weight=5 \
+            --values ./helm/agent-platform/values-production.yaml \
+            --wait \
+            --timeout=5m
+
+      # Step 2: Monitor canary for 10 minutes
+      - name: Monitor canary health (10 min)
+        run: |
+          chmod +x ./scripts/monitor-canary.sh
+          ./scripts/monitor-canary.sh \
+            --duration=600 \
+            --error-rate-threshold=0.005 \
+            --latency-p99-threshold=2000 \
+            --prometheus-url=${{ secrets.PROMETHEUS_URL }}
+
+      # Step 3: Promote to 25%, then 50%, then 100%
+      - name: Promote canary to 25%
+        run: |
+          helm upgrade agent-platform-canary ./helm/agent-platform \
+            --namespace agent-platform \
+            --set canary.weight=25 \
+            --reuse-values --wait
+
+      - name: Monitor canary at 25% (5 min)
+        run: sleep 300 && ./scripts/monitor-canary.sh --duration=60 --error-rate-threshold=0.005
+
+      - name: Full production rollout
+        run: |
+          # Promote canary to stable deployment
+          helm upgrade --install agent-platform ./helm/agent-platform \
+            --namespace agent-platform \
+            --set image.tag=sha-${{ github.sha }} \
+            --set canary.enabled=false \
+            --values ./helm/agent-platform/values-production.yaml \
+            --wait \
+            --timeout=10m
+
+          # Remove canary deployment
+          helm uninstall agent-platform-canary --namespace agent-platform
+
+      - name: Audit deployment event
+        if: always()
+        run: |
+          curl -s -X POST ${{ secrets.AUDIT_WEBHOOK_URL }} \
+            -H "Authorization: Bearer ${{ secrets.AUDIT_WEBHOOK_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "action": "deployment.completed",
+              "version": "${{ github.sha }}",
+              "environment": "production",
+              "actor": "${{ github.actor }}",
+              "status": "${{ job.status }}"
+            }'
