@@ -182,21 +182,21 @@ func (p *Pool) Return(ctx context.Context, sess *Session) {
 func (p *Pool) Navigate(ctx context.Context, sess *Session, rawURL string) (*NavigationResult, error) {
 	log := logger.FromContext(ctx)
 
-	// 1. SSRF check.
-	if err := p.secEng.ValidateURL(ctx, rawURL); err != nil {
-		return nil, err
+	// 1. Compliance check. The compliance engine covers SSRF (private-IP
+	// resolution checks), protocol allowlist, domain allow/deny lists,
+	// robots.txt, and per-domain rate limiting in one call.
+	decision, err := p.compEng.CheckURL(ctx, rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("compliance check for %s: %w", rawURL, err)
+	}
+	if !decision.Allowed {
+		return nil, fmt.Errorf("navigation blocked: %s", decision.Reason)
 	}
 
-	// 2. Compliance check (robots.txt, domain deny list, rate limit).
-	if err := p.compEng.CheckURL(ctx, p.cfg.UserAgent, rawURL); err != nil {
-		return nil, err
-	}
-
-	// 3. Enforce crawl delay — be a good citizen.
-	delay := p.compEng.GetCrawlDelay(ctx, rawURL)
-	if delay > 0 {
+	// 2. Enforce any crawl/rate-limit wait — be a good citizen.
+	if decision.WaitTime > 0 {
 		select {
-		case <-time.After(delay):
+		case <-time.After(decision.WaitTime):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

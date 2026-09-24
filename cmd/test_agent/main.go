@@ -108,7 +108,7 @@ func main() {
 			fmt.Println("Note: OPENAI_API_KEY not set, which is expected for this environment.")
 		}
 	} else {
-		fmt.Printf("Task executed successfully: %s\n", result)
+		fmt.Printf("Task executed successfully: %+v\n", result)
 	}
 
 	fmt.Println("Verification script completed successfully.")
