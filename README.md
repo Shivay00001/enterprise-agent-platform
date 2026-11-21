@@ -1,5 +1,7 @@
 # Enterprise AI Agent Platform
 
+Built by [VisionQuantech](https://visionquantech.com) — AI agents, apps & tools for small businesses.
+
 Production-grade, security-first autonomous AI agent infrastructure.  
 Designed for 10M+ users, regulatory environments, and hostile internet conditions.
 
